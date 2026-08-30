@@ -48,3 +48,8 @@ SEED = 42
 # 0.25-0.75 = 50% prediction interval
 # 0.05-0.95 = 90% prediction interval
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
+
+# --- Foundation model (Chronos-2) ---
+CHRONOS_MODEL = "amazon/chronos-bolt-small"   # fast Chronos-2 variant, CPU-friendly
+CHRONOS_DEVICE = "cpu"
+CHRONOS_CONTEXT = 2048    # cap history length for speed

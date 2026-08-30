@@ -13,6 +13,7 @@ Usage:
     uvicorn api.main:app --reload --port 8000
     Then visit: http://localhost:8000/docs
 """
+import torch  
 import io
 import json
 import pickle
@@ -25,6 +26,7 @@ from pydantic import BaseModel
 
 from src import config as C
 from src import features as F
+from src.models import foundation_model as fm
 
 
 # ──────────────────────────────────────────────
@@ -496,3 +498,71 @@ def root():
             "3. POST /evaluate/global (check metrics on test set)",
         ],
     }
+    
+
+# Add this endpoint (after your /forecast/global endpoint)
+@app.post("/forecast/foundation", response_model=ForecastResponse, tags=["forecast"])
+async def forecast_foundation(
+    file: UploadFile = File(..., description="History CSV/TSV"),
+    horizon: int = Form(24, description="Hours ahead to forecast (1-168)"),
+    interval: int = Form(90, description="50 or 90"),
+):
+    """
+    Forecast using Chronos-2 (pretrained transformer, zero-shot).
+
+    Unlike LightGBM, Chronos-2:
+    - Needs NO training — it's already pretrained by Amazon
+    - Reads raw target values — no feature engineering
+    - Works on ANY series, even ones it's never seen
+    - Does NOT use covariates (it's univariate)
+
+    First call downloads model weights (~500MB, one-time).
+    Subsequent calls are faster (~5-30 seconds depending on history length).
+    """
+    if horizon < 1 or horizon > 168:
+        raise HTTPException(422, "horizon must be between 1 and 168 for foundation model")
+    if interval not in (50, 90):
+        raise HTTPException(422, "interval must be 50 or 90")
+
+    # Parse file
+    raw = await file.read()
+    history = parse_upload(raw)
+
+    if len(history) < 50:
+        raise HTTPException(422, f"Need at least 50 rows of history, got {len(history)}")
+
+    # Extract just the target values (Chronos doesn't use features)
+    target_values = history[C.TARGET].tolist()
+    series_id = str(history[C.ID_COL].iloc[-1])
+    last_ts = pd.to_datetime(history[C.TIME_COL]).max()
+
+    # Forecast
+    quantiles = fm.forecast(target_values, horizon)
+
+    # Build response
+    step = pd.Timedelta(hours=1)
+    forecasts = []
+    for i in range(horizon):
+        ts = last_ts + (i + 1) * step
+        point = round(quantiles[0.5][i], 4)
+
+        row = {"timestamp": str(ts), "step": i + 1, "point": point}
+
+        if interval == 90:
+            row["lower_90"] = round(quantiles[0.05][i], 4)
+            row["upper_90"] = round(quantiles[0.95][i], 4)
+        else:
+            row["lower_50"] = round(quantiles[0.25][i], 4)
+            row["upper_50"] = round(quantiles[0.75][i], 4)
+
+        forecasts.append(row)
+
+    return ForecastResponse(
+        model="chronos2",
+        series_id=series_id,
+        horizon=horizon,
+        interval=interval,
+        use_exog=False,    # Chronos-2 is univariate — no covariates
+        n_history_rows=len(history),
+        forecast=forecasts,
+    )
