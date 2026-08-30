@@ -204,6 +204,20 @@ def main():
 
     # Step 3: Prepare
     train, val, test = prepare_data(df)
+    
+    # Step 4: Save splits
+    print("\n" + "=" * 50)
+    print("SAVING PREPARED DATA")
+    print("=" * 50)
+    C.DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    
+    train.to_csv(C.DATA_PROCESSED / "train.csv", index=False)
+    val.to_csv(C.DATA_PROCESSED / "val.csv", index=False)
+    test.to_csv(C.DATA_PROCESSED / "test.csv", index=False)
+    
+    print(f"Train saved: {C.DATA_PROCESSED / 'train.csv'}")
+    print(f"Val saved:   {C.DATA_PROCESSED / 'val.csv'}")
+    print(f"Test saved:  {C.DATA_PROCESSED / 'test.csv'}")
     print("\nDone. Data is ready for training.")
 
 

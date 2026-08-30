@@ -39,3 +39,12 @@ VAL_FRAC = 0.15    # 15% for validation
 # RANDOM SEED
 # ──────────────────────────────────────────────
 SEED = 42
+
+# ──────────────────────────────────────────────
+# QUANTILE REGRESSION (Conformal Prediction)
+# ──────────────────────────────────────────────
+# Quantiles for prediction intervals
+# 0.5 = point forecast (median)
+# 0.25-0.75 = 50% prediction interval
+# 0.05-0.95 = 90% prediction interval
+QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
