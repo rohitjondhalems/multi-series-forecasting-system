@@ -223,8 +223,10 @@ are within 2 percentage points of ideal, indicating well-calibrated bands.
 
 ### Chronos-2
 
-Chronos-2 generates probabilistic forecasts natively by drawing 200 sample
-paths from its learned distribution, then computing quantiles from the samples.
+`amazon/chronos-bolt-small` is a Chronos-**Bolt** model, so `BaseChronosPipeline`
+dispatches to `ChronosBoltPipeline.predict_quantiles`, which regresses all five
+quantile levels directly in one forward pass — there's no sampling step (that
+sampling-based approach is how the older, non-Bolt Chronos pipelines work).
 Coverage on the test set is 93.7% for the 90% band — slightly conservative
 (wider than necessary), which is expected for a zero-shot model.
 
@@ -238,6 +240,7 @@ Coverage on the test set is 93.7% for the 90% band — slightly conservative
 | POST | `/forecast/global` | Forecast with LightGBM (exog toggle, horizon, interval) |
 | POST | `/forecast/foundation` | Forecast with Chronos-2 (zero-shot) |
 | POST | `/evaluate/global` | Evaluate LightGBM on the saved test set |
+| POST | `/tune` | Run a hyperparameter trial for LightGBM and/or Chronos, logged to MLflow |
 
 All endpoints are documented with interactive forms at `/docs` (Swagger UI).
 Invalid inputs return well-formed HTTP errors (400/422/409).
@@ -261,16 +264,18 @@ history alone.
 
 ## Experiment tracking
 
-Model training and evaluation runs are tracked in Azure Machine Learning
-with MLflow:
+`POST /tune` runs are tracked in Azure Machine Learning with MLflow:
 
 - **Workspace**: Multi-Forecasting-System (Azure ML)
 - **Experiment**: multi-series-forecasting
-- **Tracked per run**: model parameters, feature configuration, evaluation
-  metrics (MAE, RMSE, 50%/90% coverage), training artifacts, feature importance
-- **LightGBM**: versioned trained artifacts in the model registry
-- **Chronos-2**: versioned as a pinned reference (model ID + package version),
-  not as a trained artifact
+- **Tracked per run**: hyperparameters (LightGBM's `num_leaves`,
+  `learning_rate`, etc., or the Chronos model name/context length) and
+  evaluation metrics (MAE, RMSE, 50%/90% coverage), tagged by model
+  (`lightgbm` / `chronos`) so both are comparable in one experiment
+- **Not yet wired up**: `POST /train` (the endpoint that actually produces the
+  deployed models) doesn't log to MLflow yet, and there's no MLflow Model
+  Registry integration — no registered/versioned model artifacts, no stage
+  labels. See `MLOPS.md` for the target design.
 
 ## Data handling
 
@@ -305,30 +310,32 @@ re-run." This is achieved through:
 - `SEED = 42` applied to numpy, LightGBM, and PyTorch
 - LightGBM: `deterministic=True`, `force_row_wise=True`, `n_jobs=1`
 - All dependencies pinned with exact versions in `requirements.txt`
-- Exact resolved environment in `requirements.lock.txt`
 - Python 3.11, LightGBM 4.3.0, PyTorch 2.13.0+cpu
 
 ## Project structure
 
+docker-compose.yml # Repo root - single `docker compose up` for API + UI
+requirements.txt # Pinned dependencies
+README.md
+MLOPS.md # Production deployment plan
 forecasting-service/
 ├── api/main.py # FastAPI serving endpoints
 ├── ui/app.py # Streamlit demo UI
 ├── src/
 │ ├── config.py # Central config (seeds, schema, paths)
 │ ├── features.py # Shared feature engineering (train + serve)
-│ ├── train_global.py # LightGBM quantile training
+│ ├── train_global.py # LightGBM quantile training + tuning
+│ ├── tracking.py # MLflow (Azure ML) tracking helper
 │ ├── evaluate.py # Evaluation and metrics
 │ └── models/
-│ └── foundation_model.py # Chronos-2 wrapper
+│ └── foundation_model.py # Chronos wrapper
 ├── scripts/
 │ └── prepare_data.py # Data loading, validation, splitting
+├── deploy/
+│ ├── Dockerfile.api
+│ └── Dockerfile.ui
 ├── models/ # Trained artifacts (gitignored)
-├── data/ # Raw + processed data (gitignored)
-├── docker-compose.yml
-├── Dockerfile.api / Dockerfile.ui
-├── requirements.txt # Pinned dependencies
-├── README.md
-└── MLOPS.md # Production deployment plan
+└── data/ # Raw + processed data (gitignored)
 
 
 ## What would do next/Future Scope
@@ -343,8 +350,9 @@ forecasting-service/
 4. **Cyclical encoding for cov_cat**: The compass-direction categories
    (N, NNE, NE, ...) are genuinely cyclical — a sin/cos encoding of the
    bearing angle would capture adjacency that nominal encoding misses
-5. **Larger Chronos-2 variant**: Upgrade from `chronos-2-small` (28M params)
-   to `chronos-2-base` (200M) for better zero-shot accuracy, with GPU serving
+5. **Larger foundation model variant**: Upgrade from `chronos-bolt-small` to
+   `chronos-bolt-base` for better zero-shot accuracy, or migrate to the newer
+   Chronos-2 line (e.g. `autogluon/chronos-2-small`) entirely, with GPU serving
 6. **Batch serving pipeline**: Nightly Azure ML Pipeline job to forecast
    all series and store results for dashboard consumption
 7. **Add aux_* as lagged features**: The five auxiliary channels are currently

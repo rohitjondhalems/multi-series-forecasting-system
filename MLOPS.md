@@ -44,9 +44,18 @@ serving strategy, drift monitoring, retraining triggers, and rollback.
 
 ### LightGBM (trained model)
 
-Each trained model is registered as a versioned artifact in Azure ML with MLflow:
+**Current state**: `POST /tune` logs hyperparameters and evaluation metrics
+(MAE, RMSE, 50%/90% coverage) to an MLflow run per trial via `src/tracking.py`.
+`POST /train` (the deployed-model training path) does not yet call MLflow at
+all — it writes pickles + `results.json` straight to `models/<variant>/` and
+overwrites in place, with no versioning. There is no `mlflow.register_model`
+call anywhere in the codebase yet, so nothing below this line is live —
+it's the target design once training is wired into MLflow.
 
-- **Artifact bundle**: 5 quantile `.pkl` files + `feature_columns.pkl` + `metadata.json`
+Each trained model would be registered as a versioned artifact in Azure ML
+with MLflow:
+
+- **Artifact bundle**: 5 quantile `.pkl` files + `feature_columns.pkl`
 - **Versioning**: semantic versions (v1.0, v1.1, v2.0) with stage labels
   (Staging → Production → Archived)
 - **Metadata logged per version**: seed, training window dates, feature list,
@@ -56,16 +65,23 @@ Each trained model is registered as a versioned artifact in Azure ML with MLflow
 
 ### Chronos-2 (foundation model)
 
-Chronos-2 is not retrained — it is a pretrained foundation model. What we
-version is the **reference**:
+The foundation model is not retrained — it is pretrained. What we version is
+the **reference**:
 
-- Model ID: `autogluon/chronos-2-small`
+- Model ID: `amazon/chronos-bolt-small` (current config; despite the "Chronos-2"
+  label used elsewhere in this doc and the code comments, this is the
+  Chronos-**Bolt** family — direct quantile regression, no sampling. A move to
+  the actual Chronos-2 line, e.g. `autogluon/chronos-2-small`, is a real
+  candidate upgrade, not something already done)
 - Package version: `chronos-forecasting==2.1.0`
 - PyTorch version: `2.13.0+cpu`
-- Configuration: context length (2048), num_samples (200)
+- Configuration: context length (2048). `ChronosBoltPipeline.predict_quantiles`
+  regresses quantiles directly — there is no `num_samples` knob to tune, that
+  only applies to the older sampling-based Chronos pipelines.
 
-A version bump means upgrading the model checkpoint (e.g., `chronos-2-small` →
-`chronos-2-base`) or the package version, not retraining weights.
+A version bump means upgrading the pinned model reference (e.g.
+`chronos-bolt-small` → `chronos-bolt-base`, or migrating to the Chronos-2
+family) or the package version, not retraining weights.
 
 ## 2. Serving Strategy
 
@@ -76,6 +92,30 @@ A version bump means upgrading the model checkpoint (e.g., `chronos-2-small` →
 - **When**: User uploads a CSV and gets a forecast in real-time
 - **Latency**: LightGBM ~1s for 24-step forecast; Chronos-2 ~10-30s on CPU
 - **Use case**: Ad-hoc analysis, held-out series evaluation, demo
+
+### UI serving (current)
+
+- **What**: Streamlit demo UI (`ui/app.py`) — upload/forecast/plot, model
+  toggle, exog toggle, evaluate/train tabs
+- **Where**: its own Azure Container App, 0.5 vCPU / 1 GiB, scale-to-zero —
+  kept separate from the API container so the two scale and deploy
+  independently
+- **How it reaches the API**: the `API_URL` env var. Locally (`docker compose
+  up`) this is `http://api:8000`, resolved via Compose's internal DNS — this
+  is verified working (confirmed via a local `docker compose up` run: both
+  containers built, started, and passed health checks). On Container Apps,
+  the same pattern carries over: point `API_URL` at the API Container App's
+  FQDN. If the API doesn't need to be public, give it **internal-only**
+  ingress within the Container Apps environment and only the UI's ingress
+  external — the UI becomes the sole public entry point.
+- **Deployment/update strategy**: the UI holds no model state and carries no
+  accuracy risk, so it doesn't need the blue/green canary process in Section
+  5 — a plain rolling update (Container Apps' default single-active-revision
+  mode) is enough, gated by the `/_stcore/health` check already defined in
+  `Dockerfile.ui` before Container Apps routes traffic to the new revision.
+- **Not yet done**: actually deploying either container to Azure Container
+  Apps — today "live" means verified locally via Docker Compose, not
+  deployed to Azure.
 
 ### Batch serving (production addition)
 
@@ -138,8 +178,16 @@ Triggered by drift monitoring alerts:
 
 ### Retraining pipeline
 
-The forecasting system follows an automated validate → train → evaluate →
-compare → stage → shadow test → promote workflow whenever new data arrives.
+This is the **target** workflow, not the current behavior — today `POST
+/train` retrains both variants and overwrites `models/exog|noexog/` in place,
+with no MLflow logging, no comparison against the previous version, no
+staging, and no shadow test. `POST /tune` (new) logs hyperparameters and
+metrics for a trial to MLflow, but doesn't wire into promotion either. Getting
+to the workflow below means adding MLflow tracking to `/train` itself, plus
+the comparison/staging/shadow-test/promote steps.
+
+The intended pipeline: validate → train → evaluate → compare → stage → shadow
+test → promote, running automatically whenever new data arrives.
 
 
                     New data arrives
@@ -193,11 +241,13 @@ required columns and data quality, handles preprocessing, and creates the
 train/validation/test windows.
 
 **3. Train candidate models** — the same `POST /train` endpoint trains both
-model variants (LightGBM with and without exogenous variables). Each training
-run is tracked in MLflow, including model parameters, feature configuration,
-validation metrics, training artifacts, and feature importance. No manual
+model variants (LightGBM with and without exogenous variables). No manual
 command-line execution required — everything is driven through the REST API
-or Swagger UI at `/docs`.
+or Swagger UI at `/docs`. **Not yet implemented**: `/train` itself doesn't log
+to MLflow today. `POST /tune` does (hyperparameters + MAE/RMSE/coverage per
+trial via `src/tracking.py`), but wiring the same tracking into `/train` —
+plus logging feature configuration, artifacts, and feature importance — is
+still open work.
 
 **4. Evaluate on the validation window** — candidate models are evaluated
 against the latest validation window on MAE, RMSE, and coverage metrics. The
@@ -306,25 +356,30 @@ az containerapp ingress traffic set \
 
 ### Chronos-2 rollback
 
-Since Chronos-2 is not a trained artifact, rollback means reverting the
-pinned model reference in config and restarting the container:
+Since the foundation model is not a trained artifact, rollback means
+reverting the pinned model reference in config and restarting the container.
+Today's known-good reference is `amazon/chronos-bolt-small`. Hypothetical
+example — after a future upgrade to a Chronos-2 checkpoint regresses:
 
 ```python
-# Current
+# Upgraded (regressed)
 CHRONOS_MODEL = "autogluon/chronos-2-small"
 
 # Rollback = revert config + redeploy
-CHRONOS_MODEL = "amazon/chronos-bolt-small"   # previous reference
+CHRONOS_MODEL = "amazon/chronos-bolt-small"   # known-good reference
 ```
 
 ## 6. Current implementation status
 
 | Component | Status |
 |-----------|--------|
-| Model registry (Azure ML + MLflow) | ✅ Live |
-| Online serving (FastAPI + Docker) | ✅ Live |
-| Streamlit demo UI | ✅ Live |
-| Docker Compose single-command bringup | ✅ Live |
+| Experiment tracking (`/tune` → MLflow params/metrics per run) | ✅ Live |
+| Model registry (versioned artifacts, stage labels) | 📋 not yet implemented |
+| `/train` → MLflow logging | 📋 not yet implemented |
+| API serving (FastAPI + Docker, local Docker Compose) | ✅ Live |
+| UI serving (Streamlit + Docker, local Docker Compose) | ✅ Live |
+| Either container deployed to Azure Container Apps | 📋 not yet implemented |
+| Docker Compose single-command bringup (API + UI) | ✅ Live |
 | Batch serving | 📋 not yet implemented |
 | Drift monitoring | 📋 not yet implemented |
 | Automated retraining pipeline | 📋 not yet implemented |
