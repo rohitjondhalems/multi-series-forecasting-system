@@ -14,7 +14,10 @@ services:
       - ./forecasting-service/models:/app/models
       - ./forecasting-service/data:/app/data
     env_file:
-      - .env
+      # Optional: only needed for MLFLOW_TRACKING_URI (see .env.example).
+      # /train, /forecast/*, and /evaluate/global work with no .env at all.
+      - path: .env
+        required: false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

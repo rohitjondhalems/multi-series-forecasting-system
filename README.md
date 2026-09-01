@@ -15,6 +15,12 @@ docker compose up
 - **Demo UI**: http://localhost:8501
 - **Swagger API**: http://localhost:8000/docs
 
+No setup required to get forecasting, training, and evaluation working —
+`.env` is optional. If you want `POST /tune` to log to your own MLflow
+tracking server (Azure ML or otherwise), copy `.env.example` to `.env` and
+fill in `MLFLOW_TRACKING_URI`; without it, `/tune` still runs and returns
+real metrics, it just skips logging and reports why in the response.
+
 ## Local development (without Docker)
 
 ### Setup and run
@@ -315,6 +321,7 @@ re-run." This is achieved through:
 ## Project structure
 
 docker-compose.yml # Repo root - single `docker compose up` for API + UI
+.env.example # Optional MLflow tracking config (copy to .env)
 requirements.txt # Pinned dependencies
 README.md
 MLOPS.md # Production deployment plan

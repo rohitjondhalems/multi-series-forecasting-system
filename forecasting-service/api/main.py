@@ -19,6 +19,7 @@ import torch
 import io
 import json
 import pickle
+import threading
 from typing import Optional
 
 import mlflow
@@ -319,16 +320,45 @@ def train():
 # ──────────────────────────────────────────────
 # Hyperparameter tuning (both models, tracked in MLflow)
 # ──────────────────────────────────────────────
+_MLFLOW_LOG_TIMEOUT_S = 15
+
+
 def _log_to_mlflow(run_name: Optional[str], model_tag: str, params: dict, metrics: dict):
     """Best-effort MLflow logging. Metrics are computed BEFORE this is called,
     so a tracking-server hiccup (auth, connectivity) never throws away a
-    training/backtest run that already finished — it's just reported unlogged."""
-    try:
-        with tracking.start_run(run_name, model_tag, params) as run:
-            mlflow.log_metrics(metrics)
-            return run.info.run_id, None
-    except Exception as e:
-        return None, str(e)
+    training/backtest run that already finished — it's just reported unlogged.
+
+    Bounded with a hard timeout: without valid Azure credentials (e.g. running
+    in a container with no `az` CLI, no service principal env vars, and no
+    mounted credential store), azureml-mlflow's auth falls back to an
+    interactive device-code prompt that can never complete headlessly and
+    would otherwise block this request for up to ~15 minutes."""
+    result = {}
+
+    def _do_log():
+        try:
+            with tracking.start_run(run_name, model_tag, params) as run:
+                mlflow.log_metrics(metrics)
+                result["run_id"] = run.info.run_id
+        except Exception as e:
+            result["error"] = str(e)
+
+    # A daemon thread: if this is stuck (e.g. blocked on an interactive auth
+    # prompt), it's abandoned in the background rather than holding this
+    # request — or the whole process at shutdown — hostage. join(timeout=...)
+    # returns once the deadline passes regardless of whether the thread did.
+    t = threading.Thread(target=_do_log, daemon=True)
+    t.start()
+    t.join(timeout=_MLFLOW_LOG_TIMEOUT_S)
+
+    if t.is_alive():
+        return None, (
+            f"MLflow logging timed out after {_MLFLOW_LOG_TIMEOUT_S}s — likely no "
+            "valid Azure credentials available (e.g. running in a container without "
+            "an `az` login or service principal), so auth fell back to an interactive "
+            "prompt that can't complete here."
+        )
+    return result.get("run_id"), result.get("error")
 
 
 @app.post("/tune", response_model=TuneResponse, tags=["tune"])
