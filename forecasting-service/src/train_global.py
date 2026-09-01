@@ -53,12 +53,17 @@ def create_features(df, use_exog=True):
     return X[mask], y[mask], feature_cols
 
 
-def train_quantile_models(X_train, y_train, X_val, y_val, feature_cols):
+def train_quantile_models(X_train, y_train, X_val, y_val, feature_cols,
+                           param_overrides=None, num_boost_round=500,
+                           early_stopping_rounds=50):
     """Train 5 quantile models (0.05, 0.25, 0.50, 0.75, 0.95).
     The 0.50 model = point forecast (median).
-    0.25-0.75 = 50% band. 0.05-0.95 = 90% band."""
+    0.25-0.75 = 50% band. 0.05-0.95 = 90% band.
 
-    # Deterministic params (assignment requirement: same input -> same output)
+    param_overrides lets callers (e.g. the /tune API) sweep hyperparameters
+    like num_leaves/learning_rate without touching objective/seed, which stay
+    fixed so results remain deterministic (same input -> same output)."""
+
     base_params = {
         "objective": "quantile",
         "boosting_type": "gbdt",
@@ -73,6 +78,8 @@ def train_quantile_models(X_train, y_train, X_val, y_val, feature_cols):
         "deterministic": True,
         "force_row_wise": True,
     }
+    if param_overrides:
+        base_params.update(param_overrides)
 
     models = {}
     for q in C.QUANTILES:
@@ -84,10 +91,10 @@ def train_quantile_models(X_train, y_train, X_val, y_val, feature_cols):
 
         model = lgb.train(
             params, train_data,
-            num_boost_round=500,
+            num_boost_round=num_boost_round,
             valid_sets=[val_data],
             callbacks=[
-                lgb.early_stopping(50, verbose=False),
+                lgb.early_stopping(early_stopping_rounds, verbose=False),
                 lgb.log_evaluation(period=100),
             ],
         )
@@ -132,6 +139,42 @@ def feature_importance(models, top_n=15):
         elif names[idx].startswith("cov_"):
             marker = " ← covariate"
         print(f"  {rank:2d}. {names[idx]:25s} | Gain: {importance[idx]:12.0f}{marker}")
+
+
+def tune(param_overrides: dict, use_exog: bool = True, num_boost_round: int = 500,
+         early_stopping_rounds: int = 50, save: bool = False) -> dict:
+    """Train one LightGBM variant with the given hyperparameters and return
+    test-set metrics. Used by the /tune API for hyperparameter sweeps tracked
+    in MLflow. Does not overwrite the deployed models unless save=True."""
+    train, val, test = load_prepared_data()
+    if train is None:
+        raise FileNotFoundError(
+            "Prepared data not found. Run POST /train or scripts/prepare_data first."
+        )
+
+    X_train, y_train, feature_cols = create_features(train, use_exog=use_exog)
+    X_val, y_val, _ = create_features(val, use_exog=use_exog)
+    X_test, y_test, _ = create_features(test, use_exog=use_exog)
+
+    models = train_quantile_models(
+        X_train, y_train, X_val, y_val, feature_cols,
+        param_overrides=param_overrides,
+        num_boost_round=num_boost_round,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    metrics = evaluate_models(models, X_test, y_test, "Test")
+
+    if save:
+        tag = "exog" if use_exog else "noexog"
+        output_dir = C.MODELS_DIR / tag
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for q, model in models.items():
+            with open(output_dir / f"quantile_{q}.pkl", "wb") as f:
+                pickle.dump(model, f)
+        with open(output_dir / "feature_columns.pkl", "wb") as f:
+            pickle.dump(feature_cols, f)
+
+    return metrics
 
 
 def main():

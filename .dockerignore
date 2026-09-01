@@ -1,0 +1,25 @@
+.git
+.gitignore
+README.md
+
+# Large/local-only data - mounted as volumes instead, see docker-compose.yml
+forecasting-service/data
+forecasting-service/models
+
+# Not needed in either image
+forecasting-service/tests
+forecasting-service/scripts
+
+# Secrets - injected via docker-compose env_file, never baked into an image
+.env
+
+# Python
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+
+# Editor/OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db

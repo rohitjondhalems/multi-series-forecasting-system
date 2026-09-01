@@ -19,6 +19,7 @@ build/
 venv/
 env/
 ENV/
+.env
 
 # IDE
 .vscode/
@@ -35,3 +36,4 @@ Thumbs.db
 
 # Logs
 *.log
+

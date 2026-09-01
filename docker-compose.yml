@@ -1,0 +1,39 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: forecasting-service/deploy/Dockerfile.api
+    image: forecasting-api:latest
+    container_name: forecasting-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bind-mounted (not baked into the image) so POST /train persists
+      # updated models back to the host and new raw data can be dropped in
+      # without rebuilding.
+      - ./forecasting-service/models:/app/models
+      - ./forecasting-service/data:/app/data
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: forecasting-service/deploy/Dockerfile.ui
+    image: forecasting-ui:latest
+    container_name: forecasting-ui
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

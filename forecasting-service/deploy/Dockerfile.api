@@ -1,0 +1,38 @@
+# Build context must be the repo root (docker-compose.yml handles this):
+#   docker build -f forecasting-service/deploy/Dockerfile.api .
+FROM python:3.11-slim
+
+# libgomp1 -> required at runtime by lightgbm's compiled binary (OpenMP)
+# curl     -> used by the HEALTHCHECK below
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first (better layer caching). --extra-index-url pulls the
+# CPU-only torch build (torch's "+cpu" local version outranks the default
+# CUDA build on PyPI for the same public version, so pip picks it) instead
+# of the multi-GB CUDA wheel - chronos-forecasting only needs CPU here.
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
+
+# Application code only - models/ and data/ are mounted as volumes at
+# runtime (see docker-compose.yml) so retraining via POST /train persists
+# back to the host and the image doesn't need rebuilding when models change.
+COPY forecasting-service/api ./api
+COPY forecasting-service/src ./src
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=5 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

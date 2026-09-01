@@ -1,7 +1,12 @@
 """
 Configuration for the forecasting service.
 """
+
+import os
+from dotenv import load_dotenv
 from pathlib import Path
+
+load_dotenv()
 
 # ──────────────────────────────────────────────
 # PATHS
@@ -53,3 +58,8 @@ QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 CHRONOS_MODEL = "amazon/chronos-bolt-small"   # fast Chronos-2 variant, CPU-friendly
 CHRONOS_DEVICE = "cpu"
 CHRONOS_CONTEXT = 2048    # cap history length for speed
+
+# ──────────────────────────────────────────────
+# MLFLOW (Azure ML)
+# ──────────────────────────────────────────────
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")

@@ -8,24 +8,29 @@ Endpoints:
     POST /forecast/global     - forecast using LightGBM (exog variant)
     POST /forecast/global/noexog - forecast using LightGBM (no covariates)
     POST /evaluate/global     - evaluate on test set
+    POST /tune                - hyperparameter trial for LightGBM and/or
+                                 Chronos, logged to MLflow (Azure ML)
 
 Usage:
     uvicorn api.main:app --reload --port 8000
     Then visit: http://localhost:8000/docs
 """
-import torch  
+import torch
 import io
 import json
 import pickle
 from typing import Optional
 
+import mlflow
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src import config as C
 from src import features as F
+from src import train_global
+from src import tracking
 from src.models import foundation_model as fm
 
 
@@ -196,6 +201,53 @@ class EvalResponse(BaseModel):
     metrics: dict
 
 
+class LightGBMTuneParams(BaseModel):
+    """LightGBM hyperparameters to try. objective/seed stay fixed elsewhere
+    so runs remain deterministic and comparable."""
+    use_exog: bool = True
+    num_leaves: int = 31
+    learning_rate: float = 0.05
+    feature_fraction: float = 0.8
+    bagging_fraction: float = 0.8
+    bagging_freq: int = 5
+    num_boost_round: int = 500
+    early_stopping_rounds: int = 50
+    save: bool = Field(
+        False, description="Overwrite the deployed exog/noexog model bundle with this run's models."
+    )
+
+
+class ChronosTuneParams(BaseModel):
+    """Chronos has no trainable weights, so 'tuning' means sweeping its
+    inference-time settings: which pretrained variant, and how much history
+    to feed it."""
+    model_name: str = C.CHRONOS_MODEL
+    context_length: int = C.CHRONOS_CONTEXT
+    horizon: int = 24
+    max_series: Optional[int] = Field(
+        None, description="Cap how many test-set series to backtest (omit = all)."
+    )
+
+
+class TuneRequest(BaseModel):
+    run_name: Optional[str] = None
+    lightgbm: Optional[LightGBMTuneParams] = None
+    chronos: Optional[ChronosTuneParams] = None
+
+
+class TuneResult(BaseModel):
+    run_id: Optional[str] = None
+    params: dict
+    metrics: dict
+    mlflow_error: Optional[str] = None
+
+
+class TuneResponse(BaseModel):
+    mlflow_experiment: str
+    lightgbm: Optional[TuneResult] = None
+    chronos: Optional[TuneResult] = None
+
+
 # ──────────────────────────────────────────────
 # FastAPI app
 # ──────────────────────────────────────────────
@@ -254,7 +306,6 @@ def models_info():
 def train():
     """Train LightGBM quantile models from data in data/raw/.
     Runs the same pipeline as `python -m src.train_global`."""
-    from src import train_global
     train_global.main()
 
     # Reload into memory
@@ -263,6 +314,96 @@ def train():
         _bundles[tag] = ModelBundle(C.MODELS_DIR / tag)
 
     return {"status": "trained", "variants": list(_bundles.keys())}
+
+
+# ──────────────────────────────────────────────
+# Hyperparameter tuning (both models, tracked in MLflow)
+# ──────────────────────────────────────────────
+def _log_to_mlflow(run_name: Optional[str], model_tag: str, params: dict, metrics: dict):
+    """Best-effort MLflow logging. Metrics are computed BEFORE this is called,
+    so a tracking-server hiccup (auth, connectivity) never throws away a
+    training/backtest run that already finished — it's just reported unlogged."""
+    try:
+        with tracking.start_run(run_name, model_tag, params) as run:
+            mlflow.log_metrics(metrics)
+            return run.info.run_id, None
+    except Exception as e:
+        return None, str(e)
+
+
+@app.post("/tune", response_model=TuneResponse, tags=["tune"])
+def tune(req: TuneRequest):
+    """
+    Run a hyperparameter-tuning trial for one or both models and log the
+    params + resulting metrics to MLflow (Azure ML) so runs can be compared.
+
+    - **lightgbm**: actually retrains quantile models with the given
+      hyperparameters and evaluates on the held-out test set. Set `save:
+      true` to overwrite the deployed exog/noexog bundle with this run's
+      models; otherwise it's a throwaway trial.
+    - **chronos**: has no trainable weights, so this backtests the given
+      model variant / context length zero-shot on the test set (forecast the
+      last `horizon` points of each series from the history before them).
+
+    Provide either or both. Each logs as its own MLflow run tagged
+    `model=lightgbm` / `model=chronos` under the same experiment.
+    """
+    if req.lightgbm is None and req.chronos is None:
+        raise HTTPException(422, "Provide at least one of: lightgbm, chronos")
+
+    result = {"mlflow_experiment": tracking.EXPERIMENT_NAME}
+
+    if req.lightgbm:
+        p = req.lightgbm
+        lgb_params = {
+            "num_leaves": p.num_leaves,
+            "learning_rate": p.learning_rate,
+            "feature_fraction": p.feature_fraction,
+            "bagging_fraction": p.bagging_fraction,
+            "bagging_freq": p.bagging_freq,
+        }
+        try:
+            metrics = train_global.tune(
+                lgb_params, use_exog=p.use_exog,
+                num_boost_round=p.num_boost_round,
+                early_stopping_rounds=p.early_stopping_rounds,
+                save=p.save,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(409, str(e))
+
+        log_params = {
+            **lgb_params, "use_exog": p.use_exog,
+            "num_boost_round": p.num_boost_round,
+            "early_stopping_rounds": p.early_stopping_rounds,
+        }
+        run_id, err = _log_to_mlflow(req.run_name, "lightgbm", log_params, metrics)
+
+        if p.save:
+            # Force a reload from disk next time this variant is used/served.
+            _bundles.pop("exog" if p.use_exog else "noexog", None)
+
+        result["lightgbm"] = TuneResult(run_id=run_id, params=log_params, metrics=metrics, mlflow_error=err)
+
+    if req.chronos:
+        p = req.chronos
+        params = {
+            "model_name": p.model_name,
+            "context_length": p.context_length,
+            "horizon": p.horizon,
+        }
+        try:
+            metrics = fm.evaluate(
+                model_name=p.model_name, context_length=p.context_length,
+                horizon=p.horizon, max_series=p.max_series,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(409, str(e))
+
+        run_id, err = _log_to_mlflow(req.run_name, "chronos", params, metrics)
+        result["chronos"] = TuneResult(run_id=run_id, params=params, metrics=metrics, mlflow_error=err)
+
+    return result
 
 
 # ──────────────────────────────────────────────
