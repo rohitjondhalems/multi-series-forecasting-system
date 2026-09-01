@@ -309,6 +309,18 @@ def train():
     Runs the same pipeline as `python -m src.train_global`."""
     train_global.main()
 
+    # train_global.main() no-ops (prints and returns) instead of raising when
+    # data/raw/ has no CSVs or fails validation, so check the models actually
+    # landed before trying to reload them — otherwise this fails with a raw
+    # FileNotFoundError/500 that gives no hint the real problem is missing data.
+    for tag in ("exog", "noexog"):
+        if not (C.MODELS_DIR / tag / "quantile_0.5.pkl").exists():
+            raise HTTPException(
+                422,
+                "Training did not produce any models — check that CSV files matching "
+                f"the required schema are present in {C.DATA_RAW}.",
+            )
+
     # Reload into memory
     _bundles.clear()
     for tag in ("exog", "noexog"):

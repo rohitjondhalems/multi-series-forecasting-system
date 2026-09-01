@@ -24,8 +24,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Application code only - models/ and data/ are mounted as volumes at
 # runtime (see docker-compose.yml) so retraining via POST /train persists
 # back to the host and the image doesn't need rebuilding when models change.
+# scripts/ is needed too: POST /train runs data prep from data/raw/ on first
+# use (via src/train_global.py's _run_data_prep), which imports scripts.prepare_data.
 COPY forecasting-service/api ./api
 COPY forecasting-service/src ./src
+COPY forecasting-service/scripts ./scripts
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

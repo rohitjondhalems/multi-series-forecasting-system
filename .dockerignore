@@ -8,7 +8,6 @@ forecasting-service/models
 
 # Not needed in either image
 forecasting-service/tests
-forecasting-service/scripts
 
 # Secrets - injected via docker-compose env_file, never baked into an image
 .env

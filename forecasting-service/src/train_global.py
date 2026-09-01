@@ -18,16 +18,41 @@ from src import config as C
 from src import features as F
 
 
+def _run_data_prep():
+    """Build data/processed/{train,val,test}.csv from the raw CSVs in
+    data/raw/. Runs the same three steps as `python -m scripts.prepare_data`,
+    called directly (not via its argparse main()) so this works from inside
+    a running API process. Returns True on success, False if raw data is
+    missing or fails validation."""
+    from scripts import prepare_data as PD
+
+    print("Prepared data not found — running data preparation from data/raw/ first...")
+    df = PD.read_data()
+    if df is None:
+        return False
+    if not PD.check_data(df):
+        return False
+
+    train, val, test = PD.prepare_data(df)
+    C.DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    train.to_csv(C.DATA_PROCESSED / "train.csv", index=False)
+    val.to_csv(C.DATA_PROCESSED / "val.csv", index=False)
+    test.to_csv(C.DATA_PROCESSED / "test.csv", index=False)
+    print("Data preparation complete.")
+    return True
+
+
 def load_prepared_data():
-    """Load train/val/test splits from CSV files."""
+    """Load train/val/test splits from CSV files, preparing them from
+    data/raw/ first if they don't exist yet."""
     train_path = C.DATA_PROCESSED / "train.csv"
     val_path = C.DATA_PROCESSED / "val.csv"
     test_path = C.DATA_PROCESSED / "test.csv"
 
     if not train_path.exists():
-        print(f"ERROR: Train file not found at {train_path}")
-        print("Run: python -m scripts.prepare_data first")
-        return None, None, None
+        if not _run_data_prep():
+            print(f"ERROR: Could not prepare data (no valid CSVs in {C.DATA_RAW})")
+            return None, None, None
 
     print("Loading prepared data...")
     train = pd.read_csv(train_path)
